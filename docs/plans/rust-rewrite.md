@@ -131,7 +131,7 @@ after daily use. Caps are provisional until R2 measures them.
 
 | Constant | Value | Bounds / notes |
 | --- | --- | --- |
-| `READY_TIMEOUT` | 20 s | Initial `open` only. It has to exceed a typical `ConnectTimeout` plus ProxyJump hops. If it were near infinite, a hung `open` would block the CLI forever. Revisited in R3. |
+| `READY_TIMEOUT` | 20 s | Per spawned forward, including reconnect attempts (R1 clarification: an unready reconnect must not stall retries forever). It has to exceed a typical `ConnectTimeout` plus ProxyJump hops. If it were near infinite, a hung `open` would block the CLI forever. Revisited in R3. |
 | `READY_POLL` | 20 ms | Cost is one `/proc` scan per poll per starting tunnel. |
 | `BACKOFF_MIN` / `BACKOFF_MAX` | 1 s / 60 s | A dead host settles at one `ssh` spawn per minute, visible in `ls`. |
 | `BACKOFF_RESET` | 60 s of `up` | After that much uptime, the next failure starts again at `BACKOFF_MIN`. |
@@ -139,7 +139,10 @@ after daily use. Caps are provisional until R2 measures them.
 | `AUTO_PORT_ATTEMPTS` | 3 | Only for `LPORT` `0`. |
 | `IDLE_EXIT` | 30 s | Avoids a stale daemon after an upgrade. If it were near infinite, the daemon would simply stay resident, which is harmless. |
 | `AUTOSTART_WAIT` | 2 s | How long the CLI waits for a fresh daemon's socket. |
-| `LOG_LINES` | 200 per tunnel | Provisional. R2 measures memory with 100 tunnels. If unbounded, a flapping tunnel's stderr would grow without limit. |
+| `LOG_LINES` | 200 per tunnel | Provisional. R2 measures memory with 100 tunnels, including the separate current-attempt diagnostic ring used to classify auto-port retries. If unbounded, a flapping tunnel's stderr would grow without limit. |
+| `LOG_LINE_BYTES` | 4 KiB input bytes | R1 hardening: split unterminated diagnostics into bounded chunks. Lossy UTF-8 conversion can expand each chunk by up to 3×. Provisional until R2's memory measurement; without this cap, one line bypasses `LOG_LINES`. |
+| Probe output limits | 1 MiB stdout, 16 KiB stderr tail | R1 hardening: reject oversized `ssh -G` configuration output, retain bounded failure diagnostics, and drain both pipes concurrently. Provisional until R2; without byte caps, a config helper or PATH wrapper can exhaust memory. |
+| Probe timeout | 20 s | R1 bounds `ssh -G` separately from forward readiness, including on reconnect. Cancellation and timeout kill its process group. Revisited with readiness timings in R3. |
 | `MAX_REQUEST_BYTES` | 64 KiB | Provisional. It bounds a malicious or buggy local client. Requests are tiny. |
 | Default keepalive | 15 s × 3 | Applied only when `ssh -G` reports interval 0. |
 
@@ -301,7 +304,57 @@ Verification on Linux with rustc 1.99.0, cargo 1.99.0 and OpenSSH 10.6p1:
 
 ### R1 — Engine
 
-**Status:** not started.
+**Status:** complete (implementation and local verification, 2026-10-25).
+Implemented the forward parser, host validation, bounded `ssh -G` probe,
+forced-option argv builder, procfs listener detection, and a library-only
+`Tunnel` supervisor with snapshots, subscriptions, bounded logs, reconnect
+backoff, automatic ports, per-tunnel agent environment, and awaited kill.
+Forward children have their own process group and parent-death SIGTERM with
+a parent-race check. Dropping a handle requests cleanup; `kill()` waits for
+child exit and port release, even if an earlier kill future was cancelled.
+The daemon and CLI remain for R2 and R3; no user-facing commands were added.
+Changes remain uncommitted.
+
+Clarifications/hardening beyond the original build list: readiness timeout
+also bounds each reconnect attempt so a hung retry cannot stall forever;
+probe output and individual log lines have byte caps in Constants. Tests
+shorten timeouts through library settings, not product environment knobs.
+
+Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1:
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 32 tests (nine fake-SSH, 15 library,
+  eight engine integration), with five opt-in entries ignored. Covers
+  readiness, immediate failure and timeout with reaped children, the default
+  two-second kill grace, 1/2/4-second reconnect scheduling, cancellation,
+  auto-port retry limits, host rejection before any execution, and agent
+  environment isolation.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed: five entries, including real-forward echo round-trips before and
+  after reconnect. The fixture stops the complete sshd descendant tree, not
+  just its listener group; test keepalives are 2 × 2 and reconnecting is
+  required within 15 seconds.
+- `clean_target=$(mktemp -d "$PWD/target/r1-clean.XXXXXX"); CARGO_TARGET_DIR="$clean_target" cargo test --offline --locked; status=$?; rm -rf "$clean_target"; exit "$status"`
+  passed all default tests with an empty build directory. This verifies that
+  the workspace builds fake-SSH before engine integration tests use it;
+  the temporary build directory was removed.
+
+#### Post-implementation review hardening
+
+- Cancelling `kill()` no longer detaches the stored join handle; a later
+  `kill()` still waits for cleanup. A stubborn-child regression covers it.
+- Probe cancellation, timeout, and output overflow kill the complete probe
+  process group. Concurrent bounded readers prevent noisy config helpers
+  from retaining unlimited stdout/stderr. Descendant-cleanup, overflow,
+  simultaneous-output, and timeout regressions pass.
+- Automatic-port bind retries inspect only the current attempt's diagnostics,
+  not a previous bind error still in the persistent log ring. Regressions
+  cover a bind failure followed by authentication failure, the three-attempt
+  cap, and eventual success.
+- Independent review reverified all four findings, reran default and opt-in
+  tests, fmt, clippy, and whitespace checks, and found no remaining issues.
 
 **Builds:**
 
