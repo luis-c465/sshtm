@@ -17,7 +17,13 @@ use crate::{
 pub const MAX_KILL_INDICES: usize = 4096;
 
 #[derive(Debug, Parser)]
-#[command(name = "sshtm", version, about = "Supervise local SSH port forwards")]
+#[command(
+    name = "sshtm",
+    version,
+    about = "Supervise local SSH port forwards",
+    long_about = "Supervise local SSH port forwards using your existing OpenSSH configuration.\n\nOnly open starts the background daemon. Bare sshtm lists tunnels. Tunnels are\nnot saved or restored after a daemon restart. Linux only; requires ssh on PATH.",
+    after_help = "Examples:\n  sshtm open my-host 5432 6379\n  sshtm open my-host 0:db.internal:5432\n  sshtm ls\n  sshtm kill 1\n\nExit codes: 0 success, 1 operation failure, 2 usage error."
+)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -26,7 +32,12 @@ pub struct Args {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Open one tunnel per spec, using the system SSH configuration
+    #[command(
+        long_about = "Open one SSH connection per spec and wait for its local listener.\n\nThe host is an SSH alias, user@host, or hostname. Remote hosts are resolved from\nthe SSH server. All local listeners bind to 127.0.0.1. Authentication is\nnoninteractive: run ssh <host> once first if a host key or passphrase needs input.\nMultiple specs are attempted in order; successes remain if another spec fails.",
+        after_help = "Examples:\n  sshtm open my-host 5432 6379\n  sshtm open my-host 15432:5432\n  sshtm open my-host db.internal:5432\n  sshtm open my-host 0:db.internal:5432\n  sshtm open my-host '[::1]:5432'\n\nA numeric first field in a two-field spec is a local port. Local 0 chooses a\nfree port; remote ports must be 1..65535. Bare 0 is invalid. Up means the local\nlistener is ready, not that the remote destination is reachable."
+    )]
     Open {
+        /// SSH alias, user@host, or hostname (no whitespace or leading hyphen)
         #[arg(value_parser = host_argument, add = ArgValueCompleter::new(complete_hosts))]
         host: String,
         /// PORT, LPORT:PORT, RHOST:PORT, or LPORT:RHOST:PORT (local 0 picks a port)
@@ -34,33 +45,55 @@ pub enum Command {
         specs: Vec<Forward>,
     },
     /// List tunnels (also the default command)
+    #[command(
+        after_help = "Examples:\n  sshtm\n  sshtm ls\n  sshtm ls --json\n\nStates: starting, up, reconnecting. Indices stay fixed until removal. Uptime is\nseconds in the current up period. With no daemon, prints no tunnels (JSON: [])."
+    )]
     Ls {
         /// Print a stable JSON array instead of a table
         #[arg(long)]
         json: bool,
     },
     /// Kill tunnels by index or inclusive range
+    #[command(
+        after_help = "Examples:\n  sshtm kill 1 3\n  sshtm kill 2-4\n  sshtm kill --all\n\nWaits for child exit and local port release (SIGTERM, then SIGKILL after 2s).\nExisting indices are killed even if others are missing; missing indices cause\nexit 1. At most 4096 distinct indices per request; use --all for larger sets."
+    )]
     Kill {
+        /// Positive indices or inclusive ranges, for example 1 3-5
         #[arg(required_unless_present = "all", conflicts_with = "all", value_parser = index_range,
             add = ArgValueCompleter::new(complete_indices))]
         indices: Vec<IndexRange>,
+        /// Kill every tunnel
         #[arg(long)]
         all: bool,
     },
     /// Show the tunnel's recent SSH stderr lines
+    #[command(
+        after_help = "Example:\n  sshtm logs 1\n\nPrints up to 200 recent SSH stderr chunks (4 KiB input bytes each); does not\nfollow new output. Reconnecting attempts share the same bounded history."
+    )]
     Logs {
+        /// Tunnel index from ls
         #[arg(value_parser = clap::value_parser!(u32).range(1..),
             add = ArgValueCompleter::new(complete_indices))]
         index: u32,
     },
     /// List concrete aliases from ~/.ssh/config, including Include files
+    #[command(
+        after_help = "Example:\n  sshtm hosts\n\nUses the current uid's passwd home, not $HOME. Follows Include paths and globs,\nskips wildcard/negated aliases and Match blocks, then sorts and deduplicates.\nThis only lists aliases; OpenSSH itself resolves connection settings."
+    )]
     Hosts,
     /// Print dynamic shell registration (source it again after upgrades)
+    #[command(
+        after_help = "Examples (run in the corresponding shell):\n  source <(sshtm completions bash)\n  source <(sshtm completions zsh)\n  sshtm completions fish | source\n\nAdd registration to your shell startup file; regenerate after upgrades. Hosts\ncomplete from SSH config; indices from a running daemon only. Never starts one."
+    )]
     Completions {
+        /// Shell to generate registration for
         #[arg(value_enum)]
         shell: CompletionShell,
     },
     /// Kill all tunnels and stop the daemon
+    #[command(
+        after_help = "Example:\n  sshtm shutdown\n\nWaits for all tunnels to close and stops the daemon. With no daemon, succeeds\nsilently. Tunnels are not restored; reopen them after restarting or upgrading."
+    )]
     Shutdown,
     #[command(hide = true)]
     Daemon {
