@@ -1,0 +1,16 @@
+[package]
+name = "fake-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "ssh"
+path = "src/main.rs"
+
+[dependencies]
+nix = { version = "0.31", features = ["signal"] }
+
+[dev-dependencies]
+assert_cmd = "2.2"

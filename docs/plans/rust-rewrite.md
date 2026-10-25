@@ -232,7 +232,50 @@ remained on the spike ports.
 
 ### R0 — Repository and harness
 
-**Status:** not started.
+**Status:** complete (implementation and local verification, 2026-10-24).
+The edition-2024 workspace, library/binary module stubs, Rust 1.99.0 pin,
+`Cargo.lock`, Linux CI, all fake-SSH behaviors, and opt-in user-mode sshd
+harness are implemented. Both workspace members are default members, so plain
+`cargo test` exercises fake-SSH too. The `sshtm` binary deliberately reports
+“not implemented yet” until the later engine/CLI phases. Files, including the
+lockfile, remain uncommitted; no commit or GitHub Actions run was performed.
+
+Verification on Linux with rustc 1.99.0, cargo 1.99.0 and OpenSSH 10.6p1:
+
+- `cargo fetch` populated the dependency cache and generated the lockfile.
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: nine fake-SSH tests, three ignored
+  e2e entries. This covers listening, failure within 100 ms, config probing,
+  hang, flap, SIGTERM resistance, and forced-option validation.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed: success and deliberate-panic cleanup self-tests plus the internal
+  reaper entry point. Each self-test checks `echo ok` through the PATH wrapper,
+  the echo listener, session/process-group removal, and tempdir removal.
+- A fresh temporary source copy, without `target/` or `.git/`, passed
+  `CARGO_NET_OFFLINE=true cargo test --locked` using only the fetched cache.
+  This substitutes for a clean clone while these files are uncommitted; the
+  temporary source/build directory was removed afterward.
+
+#### Post-implementation review hardening
+
+- Session processes can escape the sshd listener's process group. A dedicated
+  subprocess subreaper now freezes the descendant tree until stable, kills
+  without resuming shells, and reaps descendants. Success and panic tests
+  exercise a shell poised to launch background work after its first sleep.
+- The server sets `PermitUserRC no`, verified with `sshd -T`. The fixture is
+  not a sandbox: the account's login-shell startup hooks and system SSH hooks
+  remain in effect; use a trusted test account. Fixture-owned files remain
+  under its tempdir, and no global environment or system config is changed.
+- Fake-SSH rejects conflicting forced options in either order and rejects
+  noncanonical `-o` whitespace syntax rather than accidentally accepting a
+  value that would override a required option in real OpenSSH.
+- Only the deliberate fixture-body panic is caught, with its exact payload
+  checked. Cleanup assertions execute outside that catch. Temporarily forcing
+  the marker assertion to fail made `e2e_sshd_cleanup_panic` fail as expected;
+  the fault injection was removed and the complete opt-in suite passed again.
+- Independent review rechecked all findings and found no remaining issues.
 
 **Builds:**
 
