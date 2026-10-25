@@ -257,12 +257,12 @@ fn running(pid: u32) -> bool {
 }
 #[test]
 fn signal_cleanup_and_parent_death() {
-    for signal in [Signal::SIGTERM, Signal::SIGKILL] {
+    for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGKILL] {
         let mut daemon = Daemon::new("30");
         let mut rows = Vec::new();
         for _ in 0..3 {
             rows.push(data(daemon.call(open(
-                if signal == Signal::SIGTERM {
+                if signal != Signal::SIGKILL {
                     "stubborn"
                 } else {
                     "ok"
@@ -271,7 +271,7 @@ fn signal_cleanup_and_parent_death() {
             ))));
         }
         kill(Pid::from_raw(daemon.child.id() as i32), signal).unwrap();
-        let limit = if signal == Signal::SIGTERM {
+        let limit = if signal != Signal::SIGKILL {
             Duration::from_secs(3)
         } else {
             Duration::from_secs(1)
@@ -287,7 +287,7 @@ fn signal_cleanup_and_parent_death() {
             assert!(TcpListener::bind(("127.0.0.1", port(&row))).is_ok());
         }
         daemon.child.wait().unwrap();
-        if signal == Signal::SIGTERM {
+        if signal != Signal::SIGKILL {
             assert!(!daemon.socket.exists());
         }
     }
@@ -327,5 +327,118 @@ fn daemon_memory_100() {
         "100 tunnels, full 4095-byte invalid UTF-8 input rings: {}",
         rss(daemon.child.id())
     );
+    data(daemon.call(json!({"command":"shutdown"})));
+}
+
+#[test]
+fn signals_interrupt_startup_lock_wait() {
+    use std::os::fd::AsRawFd;
+    for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = sshtm::paths::RuntimePaths::at(root.path().join("sshtm")).unwrap();
+        let lock = sshtm::paths::private_file(&paths.lock, false).unwrap();
+        assert_eq!(
+            unsafe { nix::libc::flock(lock.as_raw_fd(), nix::libc::LOCK_EX) },
+            0
+        );
+        let child = Command::new(env!("CARGO_BIN_EXE_sshtm"))
+            .arg("daemon")
+            .env("XDG_RUNTIME_DIR", root.path())
+            .spawn()
+            .unwrap();
+        let mut daemon = Daemon {
+            root,
+            socket: paths.socket,
+            child,
+        };
+        let pid = daemon.child.id();
+        // Synchronize on installed handlers rather than racing startup with a sleep.
+        wait(
+            || {
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+                let caught = status
+                    .lines()
+                    .find_map(|s| s.strip_prefix("SigCgt:"))
+                    .unwrap();
+                let caught = u64::from_str_radix(caught.trim(), 16).unwrap();
+                [Signal::SIGTERM, Signal::SIGINT]
+                    .iter()
+                    .all(|s| caught & (1 << (*s as u32 - 1)) != 0)
+            },
+            Duration::from_secs(3),
+        );
+        kill(Pid::from_raw(pid as i32), signal).unwrap();
+        wait(
+            || daemon.child.try_wait().unwrap().is_some(),
+            Duration::from_secs(1),
+        );
+        assert!(daemon.child.wait().unwrap().success());
+        assert!(!daemon.socket.exists());
+        // Keep the external lock held until exit has been verified.
+        drop(lock);
+    }
+}
+
+fn resources(pid: u32) -> (u64, usize) {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let rss = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .count();
+    (rss, fds)
+}
+
+#[test]
+#[ignore = "explicit steady-state measurement: 100 warmup and 1000 open/kill cycles"]
+fn daemon_resources_1000_cycles() {
+    let daemon = Daemon::new("30");
+    let cycle = || {
+        let row = data(daemon.call(open("ok", None)));
+        data(daemon.call(json!({"command":"kill","indices":[row["idx"]],"all":false})));
+        assert!(!running(row["pid"].as_u64().unwrap() as u32));
+        assert!(TcpListener::bind(("127.0.0.1", port(&row))).is_ok());
+    };
+    let sample = || {
+        // The kill response precedes destruction of its accepted client stream.
+        std::thread::sleep(Duration::from_millis(100));
+        resources(daemon.child.id())
+    };
+    println!("cold (RSS KiB, fds): {:?}", sample());
+    for _ in 0..100 {
+        cycle();
+    }
+    let baseline = sample();
+    println!("warm baseline (RSS KiB, fds): {baseline:?}");
+    for batch in 1..=4 {
+        for _ in 0..250 {
+            cycle();
+        }
+        let current = sample();
+        println!(
+            "after {} measured cycles (RSS KiB, fds): {current:?}",
+            batch * 250
+        );
+        assert_eq!(current.1, baseline.1, "daemon leaked descriptors");
+        // Allocator arenas and worker scheduling introduce small RSS variations;
+        // this is a bounded steady-state check, not byte-identical accounting.
+        assert!(
+            current.0 <= baseline.0 + 2048,
+            "daemon RSS grew by over 2 MiB"
+        );
+        assert!(
+            data(daemon.call(json!({"command":"list"})))
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
     data(daemon.call(json!({"command":"shutdown"})));
 }

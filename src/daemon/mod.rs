@@ -51,7 +51,12 @@ pub async fn run(paths: RuntimePaths, settings: Settings) -> Result<()> {
         crate::client::validate_startup_lock(&lock, &paths)?;
         lock
     } else {
-        Arc::new(crate::client::startup_lock(&paths).await?)
+        tokio::select! {
+            biased;
+            _ = term.recv() => return Ok(()),
+            _ = interrupt.recv() => return Ok(()),
+            lock = crate::client::startup_lock(&paths) => Arc::new(lock?),
+        }
     };
     match UnixStream::connect(&paths.socket).await {
         Ok(_) => anyhow::bail!("daemon is already running"),

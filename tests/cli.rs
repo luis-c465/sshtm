@@ -117,6 +117,54 @@ impl Drop for Cli {
 }
 
 #[test]
+fn autostarted_ssh_inherits_only_standard_descriptors() {
+    let mut cli = Cli::new();
+    cli.run(&["open", "ok", "0:5432"], 0);
+    let row = cli.rows().remove(0);
+    let pid = row["pid"].as_u64().unwrap();
+    let mut fds: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().parse::<u32>().unwrap(),
+                std::fs::read_link(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    fds.sort_by_key(|(fd, _)| *fd);
+    // fake-ssh opens just one descriptor itself: its TCP listener. In particular,
+    // the daemon's startup lock, Tokio poller, IPC listener and accepted Open
+    // connection must all be close-on-exec.
+    assert_eq!(
+        fds.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(),
+        [0, 1, 2, 3],
+        "{fds:?}"
+    );
+    assert_eq!(fds[0].1, std::path::Path::new("/dev/null"));
+    assert_eq!(fds[1].1, std::path::Path::new("/dev/null"));
+    assert!(fds[2].1.to_string_lossy().starts_with("pipe:["));
+    assert!(fds[3].1.to_string_lossy().starts_with("socket:["));
+    assert!(sshtm::daemon::ready::listening(pid as u32, port(&row)));
+}
+
+#[test]
+fn autostart_truncates_previous_daemon_log() {
+    let mut cli = Cli::new();
+    cli.run(&["open", "ok", "0:5432"], 0);
+    cli.run(&["shutdown"], 0);
+    wait(|| !cli.root.path().join("sshtm/sock").exists());
+    let log = cli.root.path().join("sshtm/daemon.log");
+    std::fs::write(&log, "old daemon diagnostics\n").unwrap();
+    cli.run(&["open", "ok", "0:5432"], 0);
+    assert!(
+        !std::fs::read_to_string(log)
+            .unwrap()
+            .contains("old daemon diagnostics")
+    );
+}
+
+#[test]
 fn multiple_opens_table_json_and_auto_port_connect() {
     let mut cli = Cli::new();
     let out = cli.run(&["open", "ok", "0:5432", "0:db:6379"], 0);

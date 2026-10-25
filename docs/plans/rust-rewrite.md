@@ -127,8 +127,9 @@ sshtm/
 ### Constants
 
 Timeouts and backoff are product choices. R1 sets them, and R3 revisits them
-after daily use. R2 measured saturated log memory and retained the caps below; R5 revisits
-resident memory and fd counts under repeated open/kill cycles.
+after daily use. R2 measured saturated log memory and retained the caps below;
+R5 confirmed bounded steady-state resident memory and stable fd counts under
+repeated open/kill cycles.
 
 | Constant | Value | Bounds / notes |
 | --- | --- | --- |
@@ -140,7 +141,7 @@ resident memory and fd counts under repeated open/kill cycles.
 | `AUTO_PORT_ATTEMPTS` | 3 | Only for `LPORT` `0`. |
 | `IDLE_EXIT` | 30 s | Avoids a stale daemon after an upgrade. If it were near infinite, the daemon would simply stay resident, which is harmless. |
 | `AUTOSTART_WAIT` | 2 s | How long the CLI waits for a fresh daemon's socket. |
-| `LOG_LINES` | 200 per tunnel | Confirmed in R2: 100 tunnels with both rings saturated by worst-case lossy UTF-8 diagnostics used 576,116 KiB daemon RSS (6,260 KiB baseline). Retained for diagnostic history; this adversarial workload costs about 5.6 MiB per tunnel, not a typical-use estimate. R5 checks steady-state growth. If unbounded, a flapping tunnel's stderr would grow without limit. |
+| `LOG_LINES` | 200 per tunnel | Confirmed in R2: 100 tunnels with both rings saturated by worst-case lossy UTF-8 diagnostics used 576,116 KiB daemon RSS (6,260 KiB baseline). Retained for diagnostic history; this adversarial workload costs about 5.6 MiB per tunnel, not a typical-use estimate. R5 measured 108 KiB RSS growth across 1,000 cycles after warmup, with 10 daemon fds throughout; retained unchanged. If unbounded, a flapping tunnel's stderr would grow without limit. |
 | `LOG_LINE_BYTES` | 4 KiB input bytes | R1 hardening: split unterminated diagnostics into bounded chunks. Lossy UTF-8 conversion can expand each chunk by up to 3×. Retained after R2's saturated-ring measurement; without this cap, one line bypasses `LOG_LINES`. |
 | Probe output limits | 1 MiB stdout, 16 KiB stderr tail | R1 hardening: reject oversized `ssh -G` configuration output, retain bounded failure diagnostics, and drain both pipes concurrently. Retained in R2 after bounded-output regressions; without byte caps, a config helper or PATH wrapper can exhaust memory. |
 | Probe timeout | 20 s | R1 bounds `ssh -G` separately from forward readiness, including on reconnect. Cancellation and timeout kill its process group. Revisited with readiness timings in R3. |
@@ -637,7 +638,66 @@ was accepted by the user on 2026-10-25; its constants are unchanged.
 
 ### R5 — Hardening
 
-**Status:** not started.
+**Status:** complete (implementation and local verification, 2026-10-25).
+Reviewed signal, parent-death, descriptor, and permission handling. The existing
+close-on-exec and validated-before-truncate mechanisms needed no changes;
+regressions now verify their behavior. SIGINT joins the ready-daemon cleanup
+coverage, and a daemon waiting for the startup lock now exits cleanly on SIGTERM
+or SIGINT without waiting for the holder. Autostart truncation of `daemon.log`
+is verified across restarts. Installation is documented in
+[`docs/install.md`](../install.md); full user documentation remains R6.
+
+Permission coverage rejects symlink directories, foreign-owned private
+directories, and unsafe runtime files (symlinks, hardlinks, group/world modes,
+FIFOs, and directories) without truncating their contents. The actual unset-XDG
+fallback is tested in a private user/mount namespace with a tmpfs `/tmp`,
+including mode 0700 and symlink/foreign-owner refusal. No host fallback path is
+touched. Namespace/procfs-dependent tests explicitly skip if unavailable; they
+ran successfully here, including the foreign-owner fixture. Pure resolution
+and tempfile-based permission tests always run.
+
+Verification on Linux with rustc/cargo 1.99.0 and OpenSSH 10.6p1
+(OpenSSL 3.6.5):
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 86 tests, eight ignored entries.
+  The autostarted fake SSH has exactly fds 0/1/2 plus its own TCP listener;
+  no startup lock, daemon listener, poller, or accepted client socket leaks.
+- `cargo test --offline --locked --test daemon daemon_resources_1000_cycles -- --ignored --nocapture`
+  passed. A debug-build daemon ran 100 warmup cycles, then 1,000 measured
+  sequential automatic-port open/kill cycles. Each cycle checked the child was
+  reaped and its local port free; each sample checked the table was empty.
+  Cold RSS was 7,480 KiB. Warm baseline was 9,072 KiB; samples after
+  250/500/750/1,000 measured cycles were 9,116/9,136/9,168/9,180 KiB.
+  Descriptor count was 10 at every sample. The 108 KiB post-warmup drift is
+  bounded allocator/runtime variation, not zero byte-for-byte growth; the
+  regression allows 2 MiB over the warm baseline. Log caps remain unchanged.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed all six entries, including real CLI forwarding, reconnect, and fixture
+  cleanup.
+- `CARGO_TARGET_DIR="$tmp" cargo test --offline --locked --test runtime_paths -- --nocapture`
+  passed with `$tmp` created by `mktemp -d /tmp/sshtm-r5-target.XXXXXX` and
+  removed afterward. This verifies fallback tests with build artifacts under
+  the directory hidden by the namespace's tmpfs.
+- `git diff --check` passed.
+
+Changes remain uncommitted; no CI run or system-wide install was performed.
+
+#### Post-implementation review hardening
+
+- Independent review reproduced a daemon swallowing termination signals while
+  waiting for the startup lock. Lock acquisition now selects against both
+  signal receivers; regressions require successful bounded exit while the
+  external lock is still held.
+- Review reproduced the namespace fixture hiding its own binaries when built
+  under `/tmp`. It now opens both executables before overlaying `/tmp` and
+  executes through inherited procfs descriptors. Both normal and temporary
+  build-directory runs pass.
+- Independent review reverified both fixes, reran fmt, clippy, default tests,
+  focused regressions and the temporary-path reproductions, and found no
+  remaining actionable issues.
 
 **Builds:**
 
