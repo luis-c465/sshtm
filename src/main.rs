@@ -1,32 +1,19 @@
-use std::{fs::File, os::fd::FromRawFd, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs::File, os::fd::FromRawFd, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use sshtm::{daemon, paths::RuntimePaths};
+use clap::{CommandFactory, Parser};
+use sshtm::{
+    cli::{self, Args, Command},
+    daemon,
+    paths::RuntimePaths,
+};
 
-#[derive(Parser)]
-#[command(name = "sshtm", version)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    #[command(hide = true)]
-    Daemon {
-        #[arg(long)]
-        idle_exit: Option<u64>,
-        #[arg(long, hide = true)]
-        startup_lock_fd: Option<i32>,
-        #[arg(long, hide = true)]
-        runtime_dir: Option<PathBuf>,
-    },
-}
-
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    // CompleteEnv mutates its activation environment variable; run before Tokio
+    // creates worker threads. Custom index completers own a short-lived runtime.
+    clap_complete::CompleteEnv::with_factory(Args::command).complete();
+    let runtime = tokio::runtime::Runtime::new().expect("create async runtime");
+    if let Err(error) = runtime.block_on(run()) {
         eprintln!("sshtm: {error:#}");
         std::process::exit(1);
     }
@@ -71,6 +58,6 @@ async fn run() -> Result<()> {
             }
             daemon::run(paths, settings).await
         }
-        None => anyhow::bail!("not implemented yet"),
+        command => cli::run(command.unwrap_or(Command::Ls { json: false })).await,
     }
 }

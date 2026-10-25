@@ -10,14 +10,14 @@ use std::{
 };
 
 use anyhow::{Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::Instant;
 
 use super::supervisor::{self, Snapshot, State, Tunnel};
 use crate::spec::Forward;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub idx: u32,
     pub host: String,

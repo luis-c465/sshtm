@@ -74,7 +74,7 @@ Out of scope:
 | Initial failure | If the child exits before it is ready, or `READY_TIMEOUT` passes, `open` fails. The child is killed, the index is freed, and the CLI exits 1 and shows the stderr tail. There are no retries before the first `up`. When `LPORT` is `0`, a bind conflict picks a new port up to `AUTO_PORT_ATTEMPTS` times. |
 | Reconnect | Once a tunnel has been `up`, any exit of its child sets it to `reconnecting`. It is respawned with exponential backoff (`BACKOFF_MIN` doubling to `BACKOFF_MAX`), and the delay resets after `BACKOFF_RESET` of uptime. It retries until killed. |
 | States | `starting`, `up`, `reconnecting` (shows the attempt number and when the next try is). A killed tunnel is removed, not kept as a "stopped" row. |
-| Kill | `sshtm kill <idx|range>...` (`2`, `1 3`, `2-4`) and `sshtm kill --all`. Indices that exist are killed. Missing ones are reported, and the CLI then exits 1. Kill sends SIGTERM, waits `KILL_GRACE`, then sends SIGKILL, and returns only once the local port is released. |
+| Kill | `sshtm kill <idx|range>...` (`2`, `1 3`, `2-4`) and `sshtm kill --all`. Indices that exist are killed. Missing ones are reported, and the CLI then exits 1. Kill sends SIGTERM, waits `KILL_GRACE`, then sends SIGKILL, and returns only once the local port is released. R3 bounds each request to 4,096 distinct indices, validated before contacting the daemon, so ranges cannot allocate unbounded memory or exceed the IPC frame cap. |
 | Default command | Bare `sshtm` is the same as `sshtm ls`. |
 | CLI surface | `open <host> <spec>...`, `ls [--json]`, `kill`, `logs <idx>` (stderr ring buffer), `hosts`, `shutdown` (kill all, stop the daemon), `completions <shell>`, `--version`. Hidden: `daemon`. |
 | Process model | One binary. The daemon is `sshtm daemon`. Only `open` starts it automatically. `ls`, `kill`, `logs` and `shutdown` with no daemon running answer "no tunnels" and do not start one. |
@@ -144,6 +144,7 @@ resident memory and fd counts under repeated open/kill cycles.
 | `LOG_LINE_BYTES` | 4 KiB input bytes | R1 hardening: split unterminated diagnostics into bounded chunks. Lossy UTF-8 conversion can expand each chunk by up to 3×. Retained after R2's saturated-ring measurement; without this cap, one line bypasses `LOG_LINES`. |
 | Probe output limits | 1 MiB stdout, 16 KiB stderr tail | R1 hardening: reject oversized `ssh -G` configuration output, retain bounded failure diagnostics, and drain both pipes concurrently. Retained in R2 after bounded-output regressions; without byte caps, a config helper or PATH wrapper can exhaust memory. |
 | Probe timeout | 20 s | R1 bounds `ssh -G` separately from forward readiness, including on reconnect. Cancellation and timeout kill its process group. Revisited with readiness timings in R3. |
+| `MAX_KILL_INDICES` | 4,096 distinct indices | R3 CLI validation limit, including expanded ranges. Even ten-digit indices fit comfortably inside the 64 KiB request frame. Without a cap, `kill 1-4294967295` could exhaust CLI memory before IPC validation. Larger batches use separate commands or `--all`. |
 | `MAX_REQUEST_BYTES` | 64 KiB | Confirmed in R2: a 1 MiB line is rejected and the daemon keeps serving. It bounds a malicious or buggy local client. Requests are tiny. |
 | `MAX_RESPONSE_BYTES` | 16 MiB | R2 client framing cap. A `logs` response contains one ring, not all tunnels; even 200 chunks of 4 KiB input consisting entirely of JSON-escaped control bytes fit below 5 MiB. Without a cap, a bad daemon could exhaust client memory. |
 | Default keepalive | 15 s × 3 | Applied only when `ssh -G` reports interval 0. |
@@ -493,7 +494,49 @@ Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1:
 
 ### R3 — CLI
 
-**Status:** not started.
+**Status:** complete (implementation and automated verification complete;
+user accepted the daily-use review on 2026-10-25).
+Implemented `open`, `ls` (also bare `sshtm`), `kill`, `logs`, and `shutdown`,
+clap validation, aligned table output with reconnect attempt/delay, stable JSON
+rows, SSH diagnostics and interactive hint, and exit codes 0/1/2. Host and all
+spec arguments are validated before any daemon request. Multiple opens run
+sequentially and continue after individual operation failures, preserving
+successful tunnels and returning exit 1 if any failed. Kill indices/ranges are
+positive, inclusive, deduplicated, and bounded by `MAX_KILL_INDICES` before
+runtime-path resolution. Host listing and completion remain R4; no placeholder
+public commands are advertised. Changes remain uncommitted; no CI run was
+performed.
+
+Clarifications: the automatic-port tests use `0:PORT`, consistent with R1's
+parser and the forward-spec decision. The `open ok 0` example below conflicts
+with R1's explicit rejection of remote port zero; bare `0` remains a usage
+error. The real-SSH CLI test likewise uses an ephemeral local port instead of
+assuming fixed port 18081 is free. The original exit criteria are retained.
+
+Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1
+(OpenSSL 3.6.5):
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 66 tests, seven ignored entries.
+  Includes eight new CLI integration tests and two CLI unit tests covering
+  multi-open output, table/JSON snapshot fields, automatic-port connectivity,
+  stderr order, failure hints, partial/range/all kills, no-autostart behavior,
+  invalid arguments before side effects, per-open agent sockets, bounded range
+  expansion, reconnect display, and success/panic cleanup of children and ports.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed all six entries. The new CLI test opens a real forward, round-trips
+  bytes through the echo listener, kills by index, and verifies the SSH child
+  is reaped, the port is free, the table is empty, and shutdown removes the
+  socket. Existing real-supervisor reconnect and fixture cleanup tests pass.
+- `git diff --check` passed.
+- Independent review found no actionable issues and independently reran fmt,
+  clippy, the eight CLI integration tests, and the two CLI unit tests.
+
+Daily-use review: the user accepted the current behavior on 2026-10-25 and
+waived the remaining week-long observation period. `READY_TIMEOUT`, probe
+timeout, and reconnect backoff values are retained unchanged.
 
 **Builds:**
 
@@ -525,7 +568,50 @@ Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1:
 
 ### R4 — Hosts and completion
 
-**Status:** not started.
+**Status:** complete (implementation and local verification, 2026-10-25).
+Implemented `hosts.rs`, `sshtm hosts`, and dynamic bash/zsh/fish registration
+through `sshtm completions <shell>`. Host discovery uses the current uid's
+passwd home, not `$HOME`, follows tilde/glob Includes relative to `~/.ssh`,
+sorts and deduplicates concrete aliases, ignores Match-block Includes, and
+bounds cycles with canonical-path tracking and a 64-level recursion limit.
+Config helpers are never executed. Host arguments complete from this reader;
+kill and logs indices complete from List requests to an existing daemon with
+host descriptions and a 300 ms response deadline. Completion errors quietly
+return no candidates and never start a daemon. CompleteEnv runs before Tokio
+creates worker threads. Listing hosts and generating registration do not
+resolve daemon runtime paths.
+
+Verification on Linux with rustc/cargo 1.99.0, clap_complete 4.6.11 and
+OpenSSH 10.6p1 (OpenSSL 3.6.5):
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 77 tests, seven ignored entries.
+  Eight host-reader unit tests cover aliases, Include expansion, relative and
+  absolute paths, missing files, cycles, quoting, comments, and Match state.
+  A fixture-backed fish-protocol test covers host candidates and prefixes.
+  CLI tests cover live kill/logs candidates, host descriptions, prefix
+  filtering, no-autostart behavior, and registration syntax through installed
+  `bash -n`, `zsh -n`, and `fish -n` (shell tools remain optional in CI).
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed all six existing entries, including real CLI forwarding and reconnect.
+- `git diff --check` passed.
+
+Changes remain uncommitted; no CI run was performed. R3's daily-use review
+was accepted by the user on 2026-10-25; its constants are unchanged.
+
+#### Post-implementation review hardening
+
+- Independent review compared parser cases against `ssh -G` and found that
+  Include block state must be restored on return, rather than leaking Match
+  state into sibling Includes. Each included file now receives its own state
+  copy, with regression coverage.
+- Interior unquoted `#` characters are literal in OpenSSH tokens. The lexer
+  now starts comments only at token boundaries; aliases and Include paths
+  containing hashes have a regression test.
+- The reviewer reverified both fixes, reran focused host/completion tests and
+  upstream comparisons, and found no remaining actionable issues.
 
 **Builds:**
 

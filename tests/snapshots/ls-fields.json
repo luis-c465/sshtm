@@ -1,0 +1,11 @@
+[
+  "attempt",
+  "host",
+  "idx",
+  "local",
+  "next_retry_ms",
+  "pid",
+  "remote",
+  "state",
+  "uptime"
+]

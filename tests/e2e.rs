@@ -144,6 +144,73 @@ fn exercise_cleanup(panic_in_body: bool) {
     }
 }
 
+struct CliDaemon<'a> {
+    fixture: &'a Sshd,
+    runtime: tempfile::TempDir,
+}
+impl CliDaemon<'_> {
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sshtm"));
+        self.fixture.configure(&mut command);
+        command.env("XDG_RUNTIME_DIR", self.runtime.path());
+        command
+    }
+    fn run(&self, args: &[&str]) -> String {
+        let output = self.command().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+}
+impl Drop for CliDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = self.command().arg("shutdown").output();
+    }
+}
+
+#[test]
+#[ignore = "requires SSHTM_E2E_SSHD=1 and unprivileged OpenSSH"]
+fn e2e_cli_forward_and_kill() {
+    if !enabled() {
+        return;
+    }
+    let fixture = Sshd::start().unwrap();
+    let cli = CliDaemon {
+        fixture: &fixture,
+        runtime: tempfile::tempdir().unwrap(),
+    };
+    // Select an ephemeral local port instead of assuming 18081 is available.
+    let spec = format!("0:127.0.0.1:{}", fixture.echo_addr().port());
+    let opened = cli.run(&["open", "spike", &spec]);
+    assert!(opened.starts_with("1 127.0.0.1:"), "{opened}");
+    let rows: serde_json::Value = serde_json::from_str(&cli.run(&["ls", "--json"])).unwrap();
+    let address = rows[0]["local"].as_str().unwrap();
+    let pid = rows[0]["pid"].as_i64().unwrap() as i32;
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(b"cli roundtrip").unwrap();
+    let mut reply = [0; 13];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"cli roundtrip");
+    drop(stream);
+    cli.run(&["kill", "1"]);
+    assert!(!process_exists(pid), "SSH child survived kill");
+    assert!(std::net::TcpListener::bind(address).is_ok());
+    assert_eq!(cli.run(&["ls", "--json"]), "[]\n");
+    cli.run(&["shutdown"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let socket = cli.runtime.path().join("sshtm/sock");
+    while socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!socket.exists());
+}
+
 #[test]
 #[ignore = "requires SSHTM_E2E_SSHD=1 and unprivileged OpenSSH"]
 fn e2e_sshd_cleanup_success() {
