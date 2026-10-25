@@ -719,7 +719,45 @@ Changes remain uncommitted; no CI run or system-wide install was performed.
 
 ### R6 — Docs and release
 
-**Status:** not started.
+**Status:** in progress (documentation and automated verification complete;
+manual release acceptance and tag pending).
+Implemented `README.md` covering installation, zero configuration, every public
+command/flag, spec grammar, SSH overrides, reconnect/lifetime behavior, runtime
+files, completion, and troubleshooting. Every user-authored public subcommand
+now has detailed help and examples. `tests/docs.rs` compares the README's
+explicit public command/flag inventory with clap and checks rendered binary
+help, including the generated help dispatcher. The documentation/help/test
+changes are present in commit `bd78868` (`docs`), which appeared in the checkout
+during this work; this agent did not create that commit.
+
+Verification on Linux with rustc/cargo 1.99.0 and OpenSSH 10.6p1
+(OpenSSL 3.6.5):
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 87 tests, eight ignored entries.
+  The first run failed the existing fake-SSH `flap_exits_after_one_second`
+  elapsed-time assertion; an immediate full rerun passed. No unrelated fixture
+  changes were made.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed all six entries, including real CLI forwarding and reconnect.
+- `install_root=$(mktemp -d "$PWD/target/r6-install.XXXXXX"); trap 'rm -rf "$install_root"' EXIT; cargo install --offline --locked --path . --root "$install_root" && "$install_root/bin/sshtm" --version && "$install_root/bin/sshtm" open --help >/dev/null`
+  passed; the installed binary reported `sshtm 0.1.0`. The temporary install
+  prefix was removed. This used the current checkout, not a fresh clone, and
+  did not replace the user's installed binary.
+- `git diff --check` passed.
+- Independent review found no current documentation mismatch or behavioral
+  regression and reran fmt, clippy, the docs test, and all 12 CLI tests. It
+  noted a future-proofing limitation: the inventory test checks canonical
+  commands/flags, not visible aliases. No visible aliases currently exist;
+  alias coverage is deferred until that surface is introduced.
+
+Remaining: a fresh-clone install and manual forward against a real host from
+the user's SSH config (the throwaway sshd run does not substitute for this
+criterion), then release acceptance and tag `v0.1.0`. No user-config host was
+contacted, no release tag was created, and no CI run was performed. This status
+update remains uncommitted.
 
 **Builds:**
 
