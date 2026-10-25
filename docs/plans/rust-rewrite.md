@@ -81,7 +81,7 @@ Out of scope:
 | Daemon lifetime | It exits `IDLE_EXIT` after its table becomes empty. On SIGTERM or SIGINT, and on `shutdown`, it kills all children and removes its socket. Children get `PR_SET_PDEATHSIG(SIGTERM)` and their own process group, so a crashed daemon leaves no orphan `ssh`. |
 | Runtime directory | `$XDG_RUNTIME_DIR/sshtm/` (mode `0700`), containing `sock` (mode `0600`), `lock`, and `daemon.log`. If `XDG_RUNTIME_DIR` is unset, use `/tmp/sshtm-<uid>/`, created `0700`. Refuse to use it if it is not owned by the user or is group- or world-accessible. |
 | Access control | Directory and socket permissions, plus a `SO_PEERCRED` check that the peer uid equals the daemon's uid. The Go daemon's unauthenticated TCP port is not reproduced. |
-| Autostart race | The CLI takes `flock` on `lock`, retries the connect, and only then spawns `current_exe() daemon` (setsid, null stdin and stdout, stderr to `daemon.log`). It waits up to `AUTOSTART_WAIT` for the socket. A daemon that starts and finds a stale `sock` removes it while holding the lock. |
+| Autostart race | The CLI takes `flock` on `lock`, retries the connect, and only then spawns `current_exe() daemon` (setsid, null stdin and stdout, stderr to `daemon.log`). It waits up to `AUTOSTART_WAIT` for the socket. R2 hardening: lock acquisition uses cancellable nonblocking retries; a close-only inherited lock descriptor keeps the same lock held through daemon bind and chmod even if the starter's runtime or process dies. The daemon validates that descriptor and restores close-on-exec. A daemon that starts and finds a stale `sock` removes it while holding the lock. |
 | IPC | One request per connection, newline-delimited JSON with `{"v":1,…}`. A version mismatch makes the CLI fail with `daemon speaks protocol N; run 'sshtm shutdown'`. Rejected: gRPC or protobuf (heavy for about six verbs on a local socket). |
 | Output | `ls` prints an aligned table: `IDX HOST LOCAL REMOTE STATE UPTIME`. `--json` prints a stable array of objects with the same fields plus `pid` and `attempt`. Errors go to stderr. Exit code 0 means success, 1 an operation failure, 2 a usage error (clap). |
 | Host listing | Parse `Host` lines in `~/.ssh/config` (from `getpwuid`, the same as ssh), following `Include` with `~` and glob expansion (relative paths are resolved against `~/.ssh`, as OpenSSH does). Skip patterns that contain `*`, `?` or `!`. `Match` blocks are ignored. The user's config already uses `Include`. |
@@ -127,7 +127,8 @@ sshtm/
 ### Constants
 
 Timeouts and backoff are product choices. R1 sets them, and R3 revisits them
-after daily use. Caps are provisional until R2 measures them.
+after daily use. R2 measured saturated log memory and retained the caps below; R5 revisits
+resident memory and fd counts under repeated open/kill cycles.
 
 | Constant | Value | Bounds / notes |
 | --- | --- | --- |
@@ -139,11 +140,12 @@ after daily use. Caps are provisional until R2 measures them.
 | `AUTO_PORT_ATTEMPTS` | 3 | Only for `LPORT` `0`. |
 | `IDLE_EXIT` | 30 s | Avoids a stale daemon after an upgrade. If it were near infinite, the daemon would simply stay resident, which is harmless. |
 | `AUTOSTART_WAIT` | 2 s | How long the CLI waits for a fresh daemon's socket. |
-| `LOG_LINES` | 200 per tunnel | Provisional. R2 measures memory with 100 tunnels, including the separate current-attempt diagnostic ring used to classify auto-port retries. If unbounded, a flapping tunnel's stderr would grow without limit. |
-| `LOG_LINE_BYTES` | 4 KiB input bytes | R1 hardening: split unterminated diagnostics into bounded chunks. Lossy UTF-8 conversion can expand each chunk by up to 3×. Provisional until R2's memory measurement; without this cap, one line bypasses `LOG_LINES`. |
-| Probe output limits | 1 MiB stdout, 16 KiB stderr tail | R1 hardening: reject oversized `ssh -G` configuration output, retain bounded failure diagnostics, and drain both pipes concurrently. Provisional until R2; without byte caps, a config helper or PATH wrapper can exhaust memory. |
+| `LOG_LINES` | 200 per tunnel | Confirmed in R2: 100 tunnels with both rings saturated by worst-case lossy UTF-8 diagnostics used 576,116 KiB daemon RSS (6,260 KiB baseline). Retained for diagnostic history; this adversarial workload costs about 5.6 MiB per tunnel, not a typical-use estimate. R5 checks steady-state growth. If unbounded, a flapping tunnel's stderr would grow without limit. |
+| `LOG_LINE_BYTES` | 4 KiB input bytes | R1 hardening: split unterminated diagnostics into bounded chunks. Lossy UTF-8 conversion can expand each chunk by up to 3×. Retained after R2's saturated-ring measurement; without this cap, one line bypasses `LOG_LINES`. |
+| Probe output limits | 1 MiB stdout, 16 KiB stderr tail | R1 hardening: reject oversized `ssh -G` configuration output, retain bounded failure diagnostics, and drain both pipes concurrently. Retained in R2 after bounded-output regressions; without byte caps, a config helper or PATH wrapper can exhaust memory. |
 | Probe timeout | 20 s | R1 bounds `ssh -G` separately from forward readiness, including on reconnect. Cancellation and timeout kill its process group. Revisited with readiness timings in R3. |
-| `MAX_REQUEST_BYTES` | 64 KiB | Provisional. It bounds a malicious or buggy local client. Requests are tiny. |
+| `MAX_REQUEST_BYTES` | 64 KiB | Confirmed in R2: a 1 MiB line is rejected and the daemon keeps serving. It bounds a malicious or buggy local client. Requests are tiny. |
+| `MAX_RESPONSE_BYTES` | 16 MiB | R2 client framing cap. A `logs` response contains one ring, not all tunnels; even 200 chunks of 4 KiB input consisting entirely of JSON-escaped control bytes fit below 5 MiB. Without a cap, a bad daemon could exhaust client memory. |
 | Default keepalive | 15 s × 3 | Applied only when `ssh -G` reports interval 0. |
 
 ## Testing
@@ -397,7 +399,68 @@ Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1:
 
 ### R2 — Daemon and IPC
 
-**Status:** not started.
+**Status:** complete (implementation and local verification, 2026-10-25).
+Implemented private runtime paths/files, bounded versioned JSON framing,
+peer-uid validation, the index table, concurrent request serving, detached
+Open-only autostart, stale-socket replacement, idle exit, and coordinated
+signal/shutdown cleanup. Starting tunnels reserve indices and ports before
+waiting for readiness; every automatic-port retry uses the same table lock.
+Kill waits for cleanup before releasing either reservation. Supervisor start
+and readiness waiting are separated so a starting tunnel can be cancelled
+without losing its cleanup handle.
+
+Only the hidden `daemon` entry point and its idle-time/runtime-path/startup-fd
+arguments were added to the binary. Public commands and output remain R3.
+The ten-process startup test uses separate integration-client processes over
+the real socket, rather than implementing R3 commands early. Changes remain
+uncommitted; no CI run was performed.
+
+Verification on Linux with rustc 1.99.0, cargo 1.99.0, and OpenSSH 10.6p1:
+
+- `cargo fmt --all --check` passed.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+  passed.
+- `cargo test --offline --locked` passed: 56 tests, six ignored entries.
+  Covers index reuse and reconnect stability, ten concurrent opens,
+  duplicate-port exclusion, ten-process autostart, starting-tunnel
+  cancellation, stale sockets, modes, version errors, oversized requests,
+  partial kill, logs, idle exit, SIGTERM escalation, and SIGKILL parent-death
+  cleanup. A killed daemon's child may remain briefly as a non-running zombie
+  under the host's init; the test requires it to be non-running and its port
+  free within one second.
+- `cargo test --offline --locked --test daemon daemon_memory_100 -- --ignored --nocapture`
+  passed. Debug-build daemon RSS was 6,260 KiB before opening tunnels and
+  576,116 KiB with 100 `ok` forwards. Each wrapper wrote 200 lines of 4,095
+  invalid UTF-8 bytes, saturating both the persistent and current-attempt
+  diagnostic rings with 3× lossy expansion. This includes allocator/runtime
+  overhead, excludes child RSS, and is deliberately adversarial. `LOG_LINES`
+  remains 200 and `LOG_LINE_BYTES` remains 4 KiB; R5 measures steady-state
+  growth rather than treating this as normal usage.
+- `SSHTM_E2E_SSHD=1 cargo test --offline --locked -- --include-ignored e2e`
+  passed all five existing opt-in entries, including real forwarding and
+  reconnect. R2 adds no separate real-SSH scenario; the public CLI round-trip
+  remains R3.
+- `git diff --check` passed.
+
+#### Post-implementation review hardening
+
+- A startup task alone did not survive Tokio runtime shutdown: its lock could
+  disappear while a detached daemon was still starting. The daemon now
+  inherits validated, close-only lock ownership through bind and chmod.
+  Regressions stop a starter, destroy its parent runtime or process, and
+  prove a competing daemon cannot bypass its lock.
+- An indefinitely blocking `flock` worker could prevent runtime shutdown
+  after request cancellation. Nonblocking acquisition with asynchronous
+  sleeps replaces it; a regression exits while an external holder still
+  owns the lock.
+- An automatic-port bind retry originally bypassed table reservations.
+  Every retry now checks and publishes its replacement under the table
+  lock. A deterministic allocator regression proposes another starting
+  tunnel's reserved port and verifies it is skipped. Weak table ownership
+  and reservation-token identity prevent callbacks from touching a reused
+  index.
+- Independent review reverified all three findings, reran default tests,
+  fmt, clippy, and whitespace checks, and found no remaining issues.
 
 **Builds:**
 

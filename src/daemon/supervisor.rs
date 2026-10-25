@@ -74,6 +74,7 @@ pub struct Snapshot {
     pub up_since: Option<Instant>,
 }
 type Logs = Arc<Mutex<VecDeque<String>>>;
+pub(crate) type PortAllocator = Arc<dyn Fn() -> Result<u16> + Send + Sync>;
 
 /// Dropping a handle requests the same cleanup as `kill`, but does not wait.
 /// Call `kill` when port release must be confirmed before returning.
@@ -90,6 +91,34 @@ impl Tunnel {
         auth_sock: Option<OsString>,
         settings: Settings,
     ) -> Result<Self> {
+        let mut tunnel = Self::start(host, forward, auth_sock, settings)?;
+        if let Err(error) = tunnel.wait_ready().await {
+            tunnel.kill().await?;
+            return Err(error);
+        }
+        Ok(tunnel)
+    }
+
+    /// Start supervision without waiting for readiness, so the daemon can reserve
+    /// an index and cancel a starting connection while retaining its join handle.
+    pub fn start(
+        host: String,
+        forward: Forward,
+        auth_sock: Option<OsString>,
+        settings: Settings,
+    ) -> Result<Self> {
+        let local = forward.local.unwrap_or(0);
+        Self::start_at(host, forward, auth_sock, settings, local, None)
+    }
+
+    pub(crate) fn start_at(
+        host: String,
+        forward: Forward,
+        auth_sock: Option<OsString>,
+        settings: Settings,
+        local: u16,
+        port_allocator: Option<PortAllocator>,
+    ) -> Result<Self> {
         sshcmd::validate_host(&host)?;
         // Also validate programmatically constructed Forward values before any spawn.
         sshcmd::forward_args(&host, &forward, forward.local.unwrap_or(1), false)?;
@@ -103,7 +132,7 @@ impl Tunnel {
         );
         let initial = Snapshot {
             state: State::Starting,
-            local: forward.local.unwrap_or(0),
+            local,
             pid: None,
             attempt: 0,
             next_retry: None,
@@ -119,28 +148,27 @@ impl Tunnel {
                 forward,
                 auth_sock,
                 settings,
+                port_allocator,
                 tx,
                 logs: worker_logs,
                 stop,
             };
             worker.run().await;
         });
-        let mut tunnel = Self {
+        Ok(Self {
             state,
             logs,
             cancel: Some(cancel),
             task: Some(task),
-        };
+        })
+    }
+    async fn wait_ready(&mut self) -> Result<()> {
         loop {
-            let snapshot = tunnel.snapshot();
-            match snapshot.state {
-                State::Up => return Ok(tunnel),
-                State::Failed(error) => {
-                    tunnel.kill().await?;
-                    bail!("{error}");
-                }
+            match self.snapshot().state {
+                State::Up => return Ok(()),
+                State::Failed(error) => bail!("{error}"),
                 State::Stopped => bail!("tunnel stopped before readiness"),
-                _ => tunnel.state.changed().await.context("supervisor stopped")?,
+                _ => self.state.changed().await.context("supervisor stopped")?,
             }
         }
     }
@@ -178,6 +206,7 @@ struct Worker {
     forward: Forward,
     auth_sock: Option<OsString>,
     settings: Settings,
+    port_allocator: Option<PortAllocator>,
     tx: watch::Sender<Snapshot>,
     logs: Logs,
     stop: oneshot::Receiver<()>,
@@ -189,8 +218,15 @@ impl Worker {
         let mut auto_attempt = 0;
         loop {
             if self.tx.borrow().local == 0 {
-                match TcpListener::bind(("127.0.0.1", 0)).and_then(|s| s.local_addr()) {
-                    Ok(addr) => self.tx.send_modify(|s| s.local = addr.port()),
+                let port = match &self.port_allocator {
+                    Some(allocate) => allocate(),
+                    None => TcpListener::bind(("127.0.0.1", 0))
+                        .and_then(|s| s.local_addr())
+                        .map(|a| a.port())
+                        .map_err(Into::into),
+                };
+                match port {
+                    Ok(port) => self.tx.send_modify(|s| s.local = port),
                     Err(error) => {
                         self.fail(format!("allocate local port: {error}"));
                         return;

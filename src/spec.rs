@@ -3,7 +3,7 @@ use std::{net::Ipv6Addr, str::FromStr};
 
 use anyhow::{Result, bail, ensure};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Forward {
     pub local: Option<u16>,
     pub rhost: String,
